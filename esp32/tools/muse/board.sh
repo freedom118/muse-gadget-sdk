@@ -49,6 +49,7 @@ case $board in
     # The Core2's bridge is a CP2104 or a CH9102F: 230400 is safe on both.
     core2)   profile=m5stack-core2; target=esp32; baud=230400 ;;
     ai-passport) profile=ai-passport;      target=esp32c3 ;;
+    es3c28p)   profile=es3c28p;            target=esp32s3 ;;
     *) echo "unknown board $board"; exit 2 ;;
 esac
 baud=${baud:-460800}
@@ -63,6 +64,11 @@ command -v idf.py >/dev/null 2>&1 || { echo "idf.py not found; activate ESP-IDF 
 cd "$root"
 B=build-muse-$profile
 defaults="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-$profile"
+# Optional per-board, un-tracked secrets overlay (e.g. a Doubao Ark key). Kept
+# out of git; appended last so its values win over the committed board overlay.
+if [ -f "devices/sdkconfig.muse-$profile.local" ]; then
+    defaults="$defaults;devices/sdkconfig.muse-$profile.local"
+fi
 if [ -n "${MUSE_BENCH:-}" ]; then
     B=$B-bench; defaults="$defaults;devices/sdkconfig.muse-bench"
 fi

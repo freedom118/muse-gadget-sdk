@@ -493,15 +493,24 @@ static void build_keyboard(void)
     if (muse_board->round) {
         lv_obj_set_size(s_text_kb, text_px(384), text_px(206));
     } else {
-        int w = muse_board->width - 16;
-        int h = muse_board->height - y - 8;
-        lv_obj_set_size(s_text_kb, w, LV_MIN(h, w * 206 / 384));
+        /* Keep the aspect ratio the design uses (384:206); on a small
+         * non-round panel the scaled width leaves the keys room for their
+         * labels instead of fixing a 224 px width with a 20 px font. */
+        int w = text_px(384);
+        if (w > muse_board->width - 8) {
+            w = muse_board->width - 8;
+        }
+        int h = w * 206 / 384;
+        lv_obj_set_size(s_text_kb, w, h);
     }
     lv_obj_align(s_text_kb, LV_ALIGN_TOP_MID, 0, y);
     lv_obj_set_style_bg_opa(s_text_kb, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(s_text_kb, 2, 0);
     lv_obj_set_style_pad_gap(s_text_kb, 4, 0);
-    lv_obj_set_style_text_font(s_text_kb, &lv_font_montserrat_20, LV_PART_ITEMS);
+    /* A small panel fits ten columns with a smaller key font. */
+    const lv_font_t *key_font = s_text_scale < 300 ? &lv_font_montserrat_16
+                                                  : &lv_font_montserrat_20;
+    lv_obj_set_style_text_font(s_text_kb, key_font, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(s_text_kb, lv_color_hex(COLOR_CARD), LV_PART_ITEMS);
     lv_obj_set_style_text_color(s_text_kb, lv_color_hex(COLOR_TEXT), LV_PART_ITEMS);
     lv_obj_set_style_radius(s_text_kb, 8, LV_PART_ITEMS);
@@ -1298,8 +1307,17 @@ static void tick_home(void)
 
 void muse_settings_ui_build(lv_obj_t *tile)
 {
-    if (muse_board->round && muse_board->height < 466) {
-        s_text_scale = muse_board->height;
+    /* The text page is laid out for a 466 px screen. Round screens scale it
+     * about their centre; small non-round panels (e.g. a 240 px-wide 2.8"
+     * panel) need the same scaling or the full keyboard's 10-column rows and
+     * the text field overflow the narrower glass. Scale by width there so the
+     * keyboard's key labels fit. */
+    if (muse_board->height < 466 || muse_board->width < 466) {
+        int scale = muse_board->round ? muse_board->height
+                                     : LV_MIN(muse_board->width, muse_board->height);
+        if (scale < s_text_scale) {
+            s_text_scale = scale;
+        }
     }
     s_tile = tile;
     build_home(tile);
