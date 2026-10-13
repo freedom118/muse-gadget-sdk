@@ -67,6 +67,7 @@ extern "C" {
 #include "cJSON.h"
 #include "minimp3.h"
 #include "muse_account_api.h"
+#include "muse_doubao_tts.h"
 #include "muse_link.h"
 #include "muse_settings.h"
 #include "muse_wifi.h"
@@ -1501,6 +1502,29 @@ static void on_chat_ack(stream_t *s)
 
 /* ---- Turn: speech ---- */
 
+/* Feeds one Doubao TTS synthesis's MP3 stream into the decoder's MP3 buffer. */
+static void tts_data(const uint8_t *data, size_t len);
+static void doubao_feed(const uint8_t *data, size_t len)
+{
+    tts_data(data, len);
+}
+
+/* The Doubao TTS task finished: let decode() drain the rest and end the message. */
+static void doubao_ended(uint32_t gen, bool ok)
+{
+    if (gen != s_turn.gen || s_turn.tts_msg < 0) {
+        return;
+    }
+    if (!ok) {
+        ESP_LOGW(TAG, "doubao tts failed; finishing message silently");
+        s_turn.msgs[s_turn.tts_msg].tts = TTS_FINISHED;
+        s_turn.tts_msg = -1;
+        s_turn.mp3_len = 0;
+        return;
+    }
+    s_turn.mp3_ended = true;
+}
+
 static void start_tts(void)
 {
     if (s_turn.tts_msg >= 0) {
@@ -1511,28 +1535,30 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
-        /*
-         * Replies are text, shown at reading pace: silence in place of speech
-         * paces the captions and ends the turn. To speak them instead, send
-         * the message's text (s_turn.texts + i * TEXT_MAX, if texts was
-         * allocated; up to TEXT_MAX - 1 bytes) to a TTS API of your choice and
-         * play the MP3 it returns. In place of the silence below: keep
-         * m.tts = TTS_ACTIVE and s_turn.tts_msg = i, set s_turn.silent = false,
-         * m.pcm_start = s_turn.pcm_out, m.pcm_frames = 0, s_turn.mp3_len = 0,
-         * s_turn.mp3_ended = false, s_turn.kbps = 0, s_turn.down_rate = 0 and
-         * mp3dec_init(&s_turn.dec). Then, on this task, pass the MP3 to
-         * tts_data() as it arrives (it buffers up to MP3_BUF and drops the
-         * rest, so hold off while it's full) and set s_turn.mp3_ended at the
-         * end. decode() plays it at the speaker's volume, captions following,
-         * and finishes the message once it's drained.
-         */
+        const char *text = s_turn.texts ? s_turn.texts + i * TEXT_MAX : nullptr;
+
         m.pcm_start = s_turn.pcm_out;
-        m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+        m.pcm_frames = 0;
         m.tts = TTS_ACTIVE;
         s_turn.tts_msg = i;
-        s_turn.silent = true;
-        ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
+        s_turn.silent = false;
+        s_turn.mp3_len = 0;
+        s_turn.mp3_ended = false;
+        s_turn.kbps = 0;
+        s_turn.down_rate = 0;
+        mp3dec_init(&s_turn.dec);
         show_reply_start(m);
+
+        bool spoke = text && muse_doubao_tts_start(text, s_turn.gen);
+        if (!spoke) {
+            /* No TTS (clock not synced yet, or service unavailable): fall back
+             * to the original reading-pace silence so captions still advance. */
+            m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+            s_turn.silent = true;
+            ESP_LOGI(TAG, "showing message %s silently (%u chars)", m.id, (unsigned)m.len);
+        } else {
+            ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
+        }
         return;
     }
 }
@@ -1917,6 +1943,7 @@ static void handle(const cmd_t &cmd)
     case CMD_CANCEL:
         if (cmd.gen == s_turn.gen && !s_turn.text && s_turn.phase != P_IDLE) {
             ESP_LOGI(TAG, "turn cancelled");
+            muse_doubao_tts_cancel(cmd.gen);
             turn_finish();
         }
         break;
@@ -1990,6 +2017,9 @@ static void hatch_task(void *arg)
         }
         if (s_turn.phase == P_WAIT_REPLY) {
             start_tts();
+            if (!s_turn.silent && s_turn.tts_msg >= 0) {
+                muse_doubao_tts_pump(doubao_feed, doubao_ended);
+            }
             decode();
         }
         if (!s_connected) {
@@ -2051,6 +2081,7 @@ extern "C" void muse_hatch_start(void)
     }
     s_in = xStreamBufferCreateWithCaps(IN_BYTES, 1, MALLOC_CAP_SPIRAM);
     s_out = xStreamBufferCreateWithCaps(OUT_BYTES, 1, MALLOC_CAP_SPIRAM);
+    muse_doubao_tts_init();
     s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
     s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
     s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;

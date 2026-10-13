@@ -43,7 +43,7 @@ if(CONFIG_MUSE_ENABLED)
         "muse_link.c"
         "muse_ble.c")
     if(CONFIG_MUSE_HATCH)
-        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp")
+        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_doubao_tts.cpp")
         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
     else()
         list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
@@ -114,7 +114,7 @@ endif()
 
 set(muse_priv_requires
     esp_timer esp_driver_usb_serial_jtag esp_psram nvs_flash
-    bt esp-tls mbedtls esp_app_format esp_http_client
+    bt esp-tls mbedtls esp_app_format esp_http_client esp_websocket_client
     noise_core minimp3
     esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
     esp_driver_pcnt)
@@ -137,4 +137,16 @@ if(CONFIG_MUSE_ENABLED)
     target_compile_definitions(${lvgl_lib} PUBLIC
         "LV_ASSERT_HANDLER_INCLUDE=<stdlib.h>"
         "LV_ASSERT_HANDLER=abort()\;")
+endif()
+
+
+
+
+# Doubao TTS uses lwIP dynamic local hostlist (DoH-pinned real IP). The macros
+# are defined globally for lwip in the top-level CMakeLists; mirror them on this
+# component so the declarations in lwip/dns.h are visible to muse_doubao_tts.cpp.
+if(CONFIG_MUSE_DOUBAO_TTS)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        DNS_LOCAL_HOSTLIST=1
+        DNS_LOCAL_HOSTLIST_IS_DYNAMIC=1)
 endif()

@@ -15,4 +15,19 @@
 cmake_minimum_required(VERSION 3.16)
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/project.cmake")
 project(muse-gadget)
+
+# Doubao TTS resolves the OpenSpeech host over DoH and pins the result into
+# lwIP's dynamic local hostlist (the local gateway hijacks UDP/53 with fake-ip).
+# dns_local_addhost() is compiled inside lwIP and no Kconfig exposes these
+# macros, so define them directly on the lwIP component target.
+if(CONFIG_MUSE_DOUBAO_TTS)
+    idf_build_get_property(build_components BUILD_COMPONENTS)
+    if(lwip IN_LIST build_components)
+        idf_component_get_property(lwip_target lwip COMPONENT_LIB)
+        target_compile_definitions(${lwip_target} PUBLIC
+            DNS_LOCAL_HOSTLIST=1
+            DNS_LOCAL_HOSTLIST_IS_DYNAMIC=1)
+    endif()
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/validate_config.cmake")

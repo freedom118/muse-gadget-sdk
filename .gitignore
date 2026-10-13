@@ -24,3 +24,8 @@ muse-simulator.ppm
 # Local gadget provisioning and original-device flash backups.
 .sdk-token
 /backups/
+
+
+# Local ES3C28P secrets overlay (Doubao Ark API key).
+esp32/devices/sdkconfig.muse-es3c28p.local
+

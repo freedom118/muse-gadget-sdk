@@ -194,4 +194,33 @@ menu "Muse"
             them. Needs PSRAM. Without it, voice notes go over Home Link's own
             session to its paired VM and replies are shown as text.
 
+    config MUSE_DOUBAO_TTS
+        bool "Speak replies with ByteDance Doubao Seed-TTS 2.0"
+        depends on MUSE_HATCH
+        default n
+        help
+            Synthesises each reply's text with ByteDance Doubao Seed-TTS 2.0
+            over the OpenSpeech plan WebSocket (openspeech.bytedance.com) and
+            plays the 24 kHz mono MP3 through the existing decoder/speaker
+            path. The endpoint is reachable from mainland China. The board
+            must have synced its clock over SNTP (TLS needs it). On any
+            failure it falls back to the original silent captions.
+
+    config MUSE_DOUBAO_TTS_TOKEN
+        string "Doubao/Ark API key (ark-...)"
+        depends on MUSE_DOUBAO_TTS
+        default ""
+        help
+            The Ark API key used as OpenSpeech api_key and the Bearer token.
+            This is a secret: put it in the local sdkconfig / a device overlay
+            only, never commit it.
+
+    config MUSE_DOUBAO_TTS_VOICE
+        string "Doubao Seed-TTS voice_type"
+        depends on MUSE_DOUBAO_TTS
+        default "zh_female_vv_uranus_bigtts"
+        help
+            The Seed-TTS 2.0 voice_type (speaker). The default is a general
+            female Mandarin voice verified against resource seed-tts-2.0.
+
 endmenu

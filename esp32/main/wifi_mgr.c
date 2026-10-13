@@ -23,6 +23,8 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
+#include "esp_sntp.h"
 #include "esp_log.h"
 #include "soc/soc_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -148,6 +150,20 @@ static bool drop_rssi_floor(uint8_t reason) {
 }
 #endif
 
+// SNTP: Doubao TTS validates the WSS server certificate, so the clock must be
+// set once we're online. Starts once; SNTP keeps it refreshed.
+static bool s_sntp_started;
+
+static void start_sntp(void) {
+    if (s_sntp_started) return;
+    s_sntp_started = true;
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.aliyun.com");
+    cfg.start = true;
+    cfg.sync_cb = NULL;
+    esp_netif_sntp_init(&cfg);
+    ESP_LOGI(TAG, "SNTP started");
+}
+
 static void event_handler(void *arg, esp_event_base_t base,
                           int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -191,6 +207,7 @@ static void event_handler(void *arg, esp_event_base_t base,
         s_keep_connected = true;
         s_reconnect_backoff_ms = RECONNECT_BACKOFF_MIN_MS;  // reset on success
         xEventGroupSetBits(s_events, BIT_CONNECTED | BIT_GOT_IP);
+        start_sntp();
     }
 }
 
