@@ -54,3 +54,8 @@ CONFIG_WS_BUFFER_SIZE=4096
 # set here: put CONFIG_MUSE_DOUBAO_TTS_TOKEN="ark-..." in a local, un-tracked
 # overlay appended after this one (e.g. devices/sdkconfig.muse-es3c28p.local).
 CONFIG_MUSE_DOUBAO_TTS=y
+
+# Route dictation + chat through Volcano Ark (domestic ASR + LLM). The same
+# Ark key covers it, so no separate token is needed when MUSE_DOUBAO_TTS_TOKEN
+# is set in the .local overlay. Model ids can be overridden there too.
+CONFIG_MUSE_CN_CHAT=y

@@ -33,6 +33,7 @@
 #include "muse_battery.h"
 #include "muse_ble.h"
 #include "muse_board.h"
+#include "muse_cn_chat.h"
 #include "muse_chat.h"
 #include "muse_console.h"
 #include "muse_link.h"
@@ -237,7 +238,10 @@ static void talk_button(unsigned ev)
         released = false;
     }
     if (!talk_down && !swallow && (ev & MUSE_BTN_TALK_PRESS)) {
-        if (muse_link_talk_press()) {
+        /* The domestic Ark backend needs no Muse pairing, so never let the
+         * Link pairing-confirm flow swallow the talk button: go straight to
+         * push-to-talk even while the device is unpaired/advertising. */
+        if (!muse_cn_chat_enabled() && muse_link_talk_press()) {
             /* Confirmed a Muse app pairing (Link's setup button). */
             muse_state_poke();
             swallow = true;

@@ -223,4 +223,75 @@ menu "Muse"
             The Seed-TTS 2.0 voice_type (speaker). The default is a general
             female Mandarin voice verified against resource seed-tts-2.0.
 
+    config MUSE_CN_CHAT
+        bool "Route turns through Volcano Ark (domestic ASR + LLM)"
+        depends on MUSE_HATCH
+        default n
+        help
+            Replaces Muse's cloud dictation and chat with Volcano Engine Ark
+            (火山方舟). A push-to-talk turn uploads the recorded WAV as an
+            input_audio part of an audio-understanding Doubao model, which
+            transcribes it and answers in one Chat Completions call; a typed
+            turn sends plain text. The assistant's reply still goes through the
+            existing Doubao Seed-TTS speaker path and the captions. No Muse
+            pairing or Noise connection is needed once this is on. The board
+            must have synced its clock over SNTP (TLS) and be able to reach
+            ark.cn-beijing.volces.com.
+
+    config MUSE_CN_ARK_TOKEN
+        string "Ark API key for the domestic chat backend (ark-...)"
+        depends on MUSE_CN_CHAT
+        default ""
+        help
+            The Ark API key sent as the Bearer token. Leave empty to fall back
+            to MUSE_DOUBAO_TTS_TOKEN so one key can cover chat and TTS. This is
+            a secret: put it in a local, un-tracked sdkconfig overlay, never
+            commit it.
+
+    config MUSE_CN_API_BASE
+        string "Ark Chat Completions base URL"
+        depends on MUSE_CN_CHAT
+        default "https://ark.cn-beijing.volces.com/api/plan/v3"
+        help
+            Base URL; /chat/completions is appended. The OpenSpeech/Ark API key
+            authenticates against the plan gateway (/api/plan/v3); the regular
+            Ark gateway (/api/v3) rejects a speech-console key with 401.
+
+    config MUSE_CN_ASR_RESOURCE_ID
+        string "Doubao Seed-ASR resource id"
+        depends on MUSE_CN_CHAT
+        default "volc.seedasr.sauc.duration"
+        help
+            The OpenSpeech plan-gateway resource id for streaming speech
+            recognition (Doubao Seed-ASR 2.0). Voice turns upload 16 kHz mono
+            PCM over wss://openspeech.bytedance.com/api/v3/plan/sauc/
+            bigmodel_async using this resource, then the transcript is sent to
+            the text LLM. The 1.0 fallback id is volc.bigasr.sauc.duration.
+
+    config MUSE_CN_ASR_ENDPOINT
+        string "Seed-ASR plan gateway endpoint path"
+        depends on MUSE_CN_CHAT
+        default "/api/v3/plan/sauc/bigmodel_async"
+        help
+            The plan-gateway ASR endpoint appended to the OpenSpeech host.
+            bigmodel_async is the bidirectional streaming endpoint that serves
+            Seed-ASR 2.0 under an Ark API key.
+
+    config MUSE_CN_TEXT_MODEL
+        string "LLM model id for chat turns"
+        depends on MUSE_CN_CHAT
+        default "ark-code-latest"
+        help
+            The model id sent in Chat Completions requests to the plan gateway.
+            ark-code-latest is the OpenAI-compatible model served under the
+            speech/Ark plan key; both ASR transcripts and typed text use it.
+
+    config MUSE_CN_SYSTEM_PROMPT
+        string "Robot persona system prompt"
+        depends on MUSE_CN_CHAT
+        default "你是一个友善的中文语音助手，用简洁口语化的中文回答，每次回复不超过两句话。"
+        help
+            The system message that sets the robot's persona and reply style.
+            Keep replies short: they are spoken over the speaker.
+
 endmenu

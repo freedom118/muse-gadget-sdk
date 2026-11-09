@@ -43,6 +43,7 @@
 #include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 
 #include "muse_audio.h"
 #include "muse_board.h"
@@ -302,7 +303,25 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
 
 static unsigned poll_buttons(void)
 {
-    return muse_gpio_button_poll(&s_talk);
+    unsigned ev = muse_gpio_button_poll(&s_talk);
+#if CONFIG_MUSE_CN_CHAT
+    /* On the touch ES3C28P panel, treat a screen press as the talk button
+     * too, so push-to-talk works from the touchscreen as well as BOOT. The
+     * touch state is read directly here (the LVGL indev shares the same
+     * controller). */
+    static bool s_touch_held;
+    uint8_t count = 0;
+    bool touched = touch_read_regs(TOUCH_REG_TD_STATUS, &count, 1) == ESP_OK
+                   && (count & 0x0F);
+    if (touched && !s_touch_held) {
+        s_touch_held = true;
+        ev |= MUSE_BTN_TALK_PRESS;
+    } else if (!touched && s_touch_held) {
+        s_touch_held = false;
+        ev |= MUSE_BTN_TALK_RELEASE;
+    }
+#endif
+    return ev;
 }
 
 /* No battery telemetry wired in the board profile; report the USB attachment

@@ -25,6 +25,14 @@ class ChatSession(unittest.TestCase):
         types = source[source.index('enum phase_t'):source.index('/* 10 KB')]
         handlers = source[source.index('static int find_msg('):source.index('static void on_chat_ack(')]
         reset = source[source.index('static bool turn_start('):source.index('static void turn_begin(')]
+        # The CONFIG_MUSE_CN_CHAT block now sits between turn_start() and
+        # turn_begin(); drop it so the host harness compiles only the shared
+        # Muse reply handlers without the Ark backend's ESP-IDF dependencies.
+        # `reset` ends just before turn_begin(); the CN backend block is its
+        # tail, so truncate at the marker rather than re-attach anything.
+        cn_start = reset.find('/* ---- Volcano Ark domestic backend')
+        if cn_start != -1:
+            reset = reset[:cn_start]
         code = r'''
 #include <cassert>
 #include <cstdint>

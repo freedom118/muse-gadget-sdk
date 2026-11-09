@@ -20,6 +20,7 @@
 
 #include "freertos/FreeRTOS.h"
 
+#include "muse_cn_chat.h"
 #include "muse_link.h"
 #include "muse_settings.h"
 #include "muse_wifi.h"
@@ -39,6 +40,10 @@ void muse_hatch_report(muse_hatch_state_t state, const char *detail)
 
 bool muse_hatch_configured(void)
 {
+    /* The Ark backend needs no Muse pairing, only its API key. */
+    if (muse_cn_chat_enabled()) {
+        return true;
+    }
     return muse_settings_hatch_token_len() > 0 || muse_link_hatch_linked();
 }
 
@@ -62,6 +67,21 @@ void muse_hatch_status(muse_hatch_status_t *out)
     if (!muse_hatch_configured()) {
         out->state = MUSE_HATCH_NOT_SET;
         strlcpy(out->detail, "Pair in the Muse app", sizeof(out->detail));
+        return;
+    }
+    /* Ark mode has no persistent connection: report ready (or offline without
+     * Wi-Fi) rather than the pairing/Noise states. */
+    if (muse_cn_chat_enabled()) {
+        if (!muse_wifi_connected()) {
+            out->state = MUSE_HATCH_OFFLINE;
+            strlcpy(out->detail, "Waiting for Wi-Fi", sizeof(out->detail));
+        } else if (!muse_cn_chat_clock_ready()) {
+            out->state = MUSE_HATCH_TESTING;
+            strlcpy(out->detail, "Syncing clock...", sizeof(out->detail));
+        } else {
+            out->state = MUSE_HATCH_REACHABLE;
+            strlcpy(out->detail, "Ark ready", sizeof(out->detail));
+        }
         return;
     }
     portENTER_CRITICAL(&s_lock);

@@ -67,6 +67,7 @@ extern "C" {
 #include "cJSON.h"
 #include "minimp3.h"
 #include "muse_account_api.h"
+#include "muse_cn_chat.h"
 #include "muse_doubao_tts.h"
 #include "muse_link.h"
 #include "muse_settings.h"
@@ -81,6 +82,18 @@ extern "C" {
 using namespace musegadgets::noise::core;
 
 static const char *TAG = "muse_chat_session";
+
+#ifndef CONFIG_MUSE_CN_CHAT
+#define CONFIG_MUSE_CN_CHAT 0
+#endif
+/* When set, turns bypass Muse's VM entirely: the recorded WAV (or typed text)
+ * goes to Volcano Ark and the reply is injected into the existing message/TTS
+ * state machine. See muse_cn_chat.cpp. */
+#define CN_CHAT CONFIG_MUSE_CN_CHAT
+/* A CN voice turn buffers 20 s of raw 16 kHz mono s16le PCM (the same cap the
+ * Muse note path allows), then runs Seed-ASR followed by the Ark LLM. */
+#define CN_WAV_CAP (MIC_RATE * 2 * 20)
+#define CN_TRANSCRIPT_CAP 1024
 
 #define NOISE_PATH "/v1/noise"
 #define NOISE_PORT 443
@@ -245,6 +258,14 @@ struct turn_t {
     resampler_t down;
     int kbps;
     int down_rate;
+    /* CONFIG_MUSE_CN_CHAT: a self-contained turn that never opens a Noise
+     * stream. cn_wav holds the full WAV (header + PCM), cn_cancel is polled by
+     * the blocking Ark request. */
+    uint8_t *cn_wav;
+    size_t cn_wav_len;
+    char *cn_text;         /* typed turn's message (malloc'd, freed on finish) */
+    volatile bool cn_cancel;
+    bool cn_pending;       /* a CN request still has to run on the task loop */
 };
 
 /* 10 KB, most of it the MP3 decoder: in PSRAM on boards that let static data go
@@ -960,6 +981,12 @@ static void turn_finish(void)
     s_turn.tts_msg = -1;
     s_turn.silent = false;
     s_turn.mp3_len = 0;
+    s_turn.cn_pending = false;
+    s_turn.cn_cancel = false;
+    if (s_turn.cn_text) {
+        free(s_turn.cn_text);
+        s_turn.cn_text = nullptr;
+    }
 }
 
 static void turn_fail(const char *why)
@@ -1014,8 +1041,172 @@ static bool turn_start(uint32_t gen, bool text)
     return true;
 }
 
+/* Defined later with the Muse reply path; reused to surface the opening line. */
+static void show_reply_start(const msg_t &m);
+
+/* ---- Volcano Ark domestic backend (CONFIG_MUSE_CN_CHAT) ----
+ *
+ * A CN turn never touches the Noise connection. Voice: the mic is buffered into
+ * a WAV while P_LISTEN; on release one blocking Ark call transcribes and
+ * answers. Typed: the Ark call runs immediately. The reply is injected as a
+ * single completed message, which the existing start_tts()/decode() path then
+ * speaks through Doubao TTS exactly like a Muse reply. */
+
+/* Allocates the turn's WAV buffer once, lazily (PSRAM; ~640 KB for 20 s). */
+static bool cn_ensure_wav(void)
+{
+    if (s_turn.cn_wav) {
+        return true;
+    }
+    s_turn.cn_wav = static_cast<uint8_t *>(psram_alloc(CN_WAV_CAP));
+    return s_turn.cn_wav != nullptr;
+}
+
+/* Begins a voice turn: prepare the raw 16 kHz mono PCM buffer. */
+static bool cn_voice_begin(uint32_t gen)
+{
+    if (!cn_ensure_wav()) {
+        turn_fail("OUT OF MEMORY");
+        return false;
+    }
+    s_turn.cn_cancel = false;
+    s_turn.cn_pending = false;
+    s_turn.cn_wav_len = 0;
+    ESP_LOGI(TAG, "cn voice turn %u: recording", gen);
+    return true;
+}
+
+/* Copies mic PCM (s16le) into the buffer during P_LISTEN. Whole frames only. */
+static void cn_record(void)
+{
+    if (!s_turn.cn_wav) {
+        return;
+    }
+    for (;;) {
+        size_t room = CN_WAV_CAP - s_turn.cn_wav_len;
+        uint8_t tmp[1024];
+        size_t want = room < sizeof(tmp) ? room : sizeof(tmp);
+        if (want < 2) {
+            break;
+        }
+        size_t got = xStreamBufferReceive(s_in, tmp, want & ~(size_t)1, 0);
+        if (!got) {
+            break;
+        }
+        memcpy(s_turn.cn_wav + s_turn.cn_wav_len, tmp, got);
+        s_turn.cn_wav_len += got;
+        s_turn.pcm_bytes += got;
+    }
+}
+
+/* Adds `reply` as one finished, TTS-queued message so start_tts() speaks it. */
+static void cn_inject_reply(const char *reply)
+{
+    if (s_turn.nmsgs >= MAX_MSGS || !s_turn.texts) {
+        turn_fail("REPLY TOO LONG");
+        return;
+    }
+    int i = s_turn.nmsgs;
+    msg_t &m = s_turn.msgs[i];
+    m = msg_t{};
+    snprintf(m.id, sizeof(m.id), "cn-%u", i);
+    char *full = s_turn.texts + i * TEXT_MAX;
+    strlcpy(full, reply, TEXT_MAX);
+    m.len = strlen(full);
+    strlcpy(m.tail, full, sizeof(m.tail));
+    m.done = true;
+    /* Typed turns are console-only (matching the Muse path): no speaker. Voice
+     * turns queue for Doubao TTS. */
+    m.tts = s_turn.text ? TTS_FINISHED : TTS_QUEUED;
+    if (s_turn.text) {
+        muse_hatch_console("message_done", full, "\"msg\":%d,\"bytes\":%u", i, (unsigned)m.len);
+    }
+    s_turn.nmsgs = i + 1;
+    mark(M_TEXT);
+    mark(M_DONE);
+    show_reply_start(m);
+    ESP_LOGI(TAG, "cn reply: %u chars", (unsigned)m.len);
+}
+
+/* Runs the domestic backend for the current turn. A voice turn transcribes the
+ * recorded PCM with Seed-ASR first, then both paths ask the Ark LLM. A typed
+ * turn skips ASR and sends its text straight to the LLM. */
+static void cn_run_turn(void)
+{
+    char reply[TEXT_MAX];
+    char err[48];
+    const char *user_text = s_turn.cn_text;
+    char transcript[CN_TRANSCRIPT_CAP];
+
+    if (!s_turn.text) {
+        double secs = (double)s_turn.cn_wav_len / (MIC_RATE * 2);
+        if (secs < 0.3) {
+            turn_fail("DIDN'T CATCH THAT");
+            return;
+        }
+        mark(M_RELEASE);
+        ESP_LOGI(TAG, "cn voice: %.2fs PCM, calling Seed-ASR", secs);
+        bool asr_ok = muse_cn_asr_transcribe(s_turn.cn_wav, s_turn.cn_wav_len,
+                                             transcript, sizeof(transcript),
+                                             err, sizeof(err), &s_turn.cn_cancel);
+        if (s_turn.cn_cancel) {
+            turn_fail("CANCELLED");
+            return;
+        }
+        if (!asr_ok) {
+            turn_fail(err[0] ? err : "ASR FAILED");
+            return;
+        }
+        ESP_LOGI(TAG, "heard: \"%s\"", transcript);
+        emit(MUSE_HATCH_EV_HEARD, transcript);
+        user_text = transcript;
+    }
+
+    mark(M_SENT);
+    bool ok = muse_cn_chat_run(user_text, reply, sizeof(reply),
+                               err, sizeof(err), &s_turn.cn_cancel);
+    if (s_turn.cn_cancel) {
+        turn_fail("CANCELLED");
+        return;
+    }
+    if (!ok) {
+        turn_fail(err[0] ? err : "ARK REQUEST FAILED");
+        return;
+    }
+    emit(MUSE_HATCH_EV_SENT, nullptr);
+    cn_inject_reply(reply);
+    s_turn.chat_posted = true;
+    s_turn.chat_us = s_turn.last_event_us = now_us();
+    s_turn.phase = P_WAIT_REPLY;
+}
+
 static void turn_begin(uint32_t gen)
 {
+    if (CN_CHAT && muse_cn_chat_enabled()) {
+        /* No Noise connection needed: set up the turn bookkeeping directly. */
+        if (s_turn.phase != P_IDLE) {
+            turn_finish();
+        }
+        uint8_t *chunk = s_turn.chunk, *mp3 = s_turn.mp3, *note = s_turn.note;
+        char *texts = s_turn.texts;
+        uint8_t *wav = s_turn.cn_wav;
+        s_turn = turn_t{};
+        s_turn.chunk = chunk;
+        s_turn.mp3 = mp3;
+        s_turn.note = note;
+        s_turn.texts = texts;
+        s_turn.cn_wav = wav;
+        s_turn.gen = gen;
+        s_turn.text = false;
+        s_turn.tts_msg = -1;
+        memset(s_marks, 0, sizeof(s_marks));
+        s_reply_shown[0] = '\0';
+        s_turn.start_us = now_us();
+        if (cn_voice_begin(gen)) {
+            s_turn.phase = P_LISTEN;
+        }
+        return;
+    }
     if (!turn_start(gen, false)) {
         return;
     }
@@ -1221,6 +1412,35 @@ static void post_chat(const char *text)
 /* A typed turn: the text goes straight to the chat. */
 static void text_begin(const char *text)
 {
+    if (CN_CHAT && muse_cn_chat_enabled()) {
+        if (s_turn.phase != P_IDLE) {
+            turn_finish();
+        }
+        uint8_t *chunk = s_turn.chunk, *mp3 = s_turn.mp3, *note = s_turn.note;
+        char *texts = s_turn.texts;
+        uint8_t *wav = s_turn.cn_wav;
+        s_turn = turn_t{};
+        s_turn.chunk = chunk;
+        s_turn.mp3 = mp3;
+        s_turn.note = note;
+        s_turn.texts = texts;
+        s_turn.cn_wav = wav;
+        s_turn.text = true;
+        s_turn.tts_msg = -1;
+        s_turn.start_us = now_us();
+        s_turn.cn_text = strdup(text);
+        if (!s_turn.cn_text) {
+            muse_hatch_console("error", "OUT OF MEMORY", nullptr);
+            return;
+        }
+        ESP_LOGI(TAG, "cn typed turn: %u bytes", (unsigned)strlen(text));
+        cn_run_turn();   /* blocks; on success phase -> P_WAIT_REPLY */
+        if (s_turn.phase == P_WAIT_REPLY) {
+            mark(M_SENT);
+            muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(text));
+        }
+        return;
+    }
     if (!turn_start(0, true)) {
         return;
     }
@@ -1943,6 +2163,9 @@ static void handle(const cmd_t &cmd)
     case CMD_CANCEL:
         if (cmd.gen == s_turn.gen && !s_turn.text && s_turn.phase != P_IDLE) {
             ESP_LOGI(TAG, "turn cancelled");
+            if (CN_CHAT && muse_cn_chat_enabled()) {
+                s_turn.cn_cancel = true;   /* unblocks a running Ark request */
+            }
             muse_doubao_tts_cancel(cmd.gen);
             turn_finish();
         }
@@ -1973,7 +2196,12 @@ static void hatch_task(void *arg)
         /* Resting, the socket's keepalive (PING_US) needs no quicker polls.
          * Resting unconnected, Wi-Fi may nap (muse_wifi_nap): wait for a
          * turn or for waking (CMD_WAKE) instead of watching it. */
-        int wait_ms = !s_connected ? (s_resting ? -1 : 200) : s_turn.phase != P_IDLE ? 2 : s_resting ? 500 : 20;
+        /* A CN turn has no socket: poll the mic/commands quickly even while the
+         * Noise connection is down or resting, so recording stays real-time. */
+        bool cn_active = CN_CHAT && muse_cn_chat_enabled() && s_turn.phase != P_IDLE;
+        int wait_ms = cn_active ? 2
+                                : (!s_connected ? (s_resting ? -1 : 200)
+                                                : s_turn.phase != P_IDLE ? 2 : s_resting ? 500 : 20);
         TickType_t wait = wait_ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
         if (xQueueReceive(s_cmds, &cmd, wait) == pdTRUE) {
             handle(cmd);
@@ -1981,6 +2209,28 @@ static void hatch_task(void *arg)
                 handle(cmd);
             }
         }
+
+        /* CN backend: no Noise connection. Drive recording, the blocking Ark
+         * call, then the shared TTS/decode/check state machine entirely here. */
+        if (CN_CHAT && muse_cn_chat_enabled() && s_turn.phase != P_IDLE) {
+            if (s_turn.phase == P_LISTEN) {
+                cn_record();
+                if (s_turn.end_requested || s_turn.cn_wav_len >= CN_WAV_CAP) {
+                    s_turn.end_requested = false;
+                    cn_run_turn();   /* blocks on Ark; sets P_WAIT_REPLY or fails */
+                }
+            }
+            if (s_turn.phase == P_WAIT_REPLY) {
+                start_tts();
+                if (!s_turn.silent && s_turn.tts_msg >= 0) {
+                    muse_doubao_tts_pump(doubao_feed, doubao_ended);
+                }
+                decode();
+                check_turn();
+            }
+            continue;
+        }
+
         if (!s_connected) {
             if (!muse_wifi_connected()) {
                 s_auto_next_us = 0;
@@ -2113,7 +2363,14 @@ extern "C" void muse_hatch_chat_forget(void)
 
 extern "C" bool muse_hatch_ready(void)
 {
-    return s_cmds && muse_hatch_configured() && muse_wifi_connected();
+    if (!s_cmds || !muse_wifi_connected()) {
+        return false;
+    }
+    /* The Ark backend needs no Muse pairing/VM, only its API key. */
+    if (CN_CHAT && muse_cn_chat_enabled()) {
+        return true;
+    }
+    return muse_hatch_configured();
 }
 
 extern "C" void muse_hatch_turn_begin(void)
@@ -2161,7 +2418,8 @@ extern "C" void muse_hatch_set_resting(bool resting)
 extern "C" void muse_hatch_text_turn(char *text)
 {
     cmd_t cmd{ CMD_TEXT, 0, text };
-    if (!s_cmds || !muse_hatch_configured()) {
+    bool ready = muse_hatch_configured() || (CN_CHAT && muse_cn_chat_enabled());
+    if (!s_cmds || !ready) {
         muse_hatch_console("error", "MUSE NOT SET UP", nullptr);
         free(text);
     } else if (xQueueSend(s_cmds, &cmd, pdMS_TO_TICKS(1000)) != pdTRUE) {
